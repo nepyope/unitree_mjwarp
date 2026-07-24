@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+*.png
+*.npy
+*.npz
+smoke.log
+.DS_Store
