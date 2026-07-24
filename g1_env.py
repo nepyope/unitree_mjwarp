@@ -144,8 +144,9 @@ class G1Env:
         self.num_worlds = cfg.num_worlds
         self.backend = cfg.backend
 
-        wp.init()
         self.device = cfg.device
+        if not str(self.device).startswith("cpu"):
+            wp.init()
 
         cams: list[CameraSpec] = []
         for c in cfg.cameras:
@@ -169,16 +170,32 @@ class G1Env:
         self.nu = self.mjm.nu
         self._qpos0 = np.array(self.mjm.qpos0, dtype=np.float32)
 
-        with wp.ScopedDevice(self.device):
-            self.m = mjw.put_model(self.mjm)
-            self.d = mjw.put_data(self.mjm, self.mjd, nworld=cfg.num_worlds,
-                                  njmax=cfg.njmax, nconmax=cfg.nconmax)
+        # CPU uses the native MuJoCo engine (mj_step) over a list of MjData --
+        # the right tool for 1 (or a few) envs. GPU uses mjwarp for vectorized
+        # physics + batched rendering. Warp arrays don't apply on CPU, so the
+        # "warp" backend falls back to numpy there.
+        self.is_cpu = str(self.device).startswith("cpu")
+        if self.is_cpu and self.backend == "warp":
+            self.backend = "numpy"
 
         self._rc = None
-        self._rgb_out: dict[str, wp.array] = {}
-        self._depth_out: dict[str, wp.array] = {}
-        if cams and (cfg.render_rgb or cfg.render_depth):
-            self._setup_renderer()
+        self._rgb_out: dict = {}
+        self._depth_out: dict = {}
+        self._want_render = bool(cams) and (cfg.render_rgb or cfg.render_depth)
+
+        if self.is_cpu:
+            self._datas = [mujoco.MjData(self.mjm) for _ in range(cfg.num_worlds)]
+            for d in self._datas:
+                mujoco.mj_forward(self.mjm, d)
+            if self._want_render:
+                self._setup_renderer_cpu()
+        else:
+            with wp.ScopedDevice(self.device):
+                self.m = mjw.put_model(self.mjm)
+                self.d = mjw.put_data(self.mjm, self.mjd, nworld=cfg.num_worlds,
+                                      njmax=cfg.njmax, nconmax=cfg.nconmax)
+            if self._want_render:
+                self._setup_renderer()
 
     # -- rendering setup ---------------------------------------------------
     def _setup_renderer(self) -> None:
@@ -226,8 +243,37 @@ class G1Env:
                     self._depth_out[c.name] = wp.zeros(
                         (cfg.num_worlds, h, w), dtype=wp.float32)
 
+    def _setup_renderer_cpu(self) -> None:
+        """Native-MuJoCo offscreen renderers (one per unique resolution). Needs a
+        GL backend; on a headless box set MUJOCO_GL=egl (or osmesa)."""
+        self._cam_index = {}
+        self._cam_res = {}
+        for c in self._cams:
+            cid = mujoco.mj_name2id(self.mjm, mujoco.mjtObj.mjOBJ_CAMERA, c.name)
+            if cid < 0:
+                raise RuntimeError(f"camera {c.name!r} not found after compile")
+            self._cam_index[c.name] = cid
+            self._cam_res[c.name] = (c.width, c.height)
+        try:
+            self._renderers = {}
+            for c in self._cams:
+                key = (c.height, c.width)
+                if key not in self._renderers:
+                    self._renderers[key] = mujoco.Renderer(self.mjm, c.height, c.width)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "CPU camera rendering needs a GL context. On a headless machine "
+                "set MUJOCO_GL=egl (or osmesa) before importing. "
+                f"Underlying error: {e}") from e
+
     # -- conversion helper -------------------------------------------------
-    def _out(self, arr: wp.array):
+    def _out(self, arr):
+        """arr is a wp.array (GPU) or np.ndarray (CPU)."""
+        if isinstance(arr, np.ndarray):
+            if self.backend == "torch":
+                import torch
+                return torch.as_tensor(arr)
+            return arr
         if self.backend == "warp":
             return arr
         if self.backend == "numpy":
@@ -239,6 +285,16 @@ class G1Env:
     # -- core API ----------------------------------------------------------
     def reset(self, qpos: np.ndarray | None = None) -> dict:
         """Reset all worlds to the model reference pose (or a supplied qpos)."""
+        if self.is_cpu:
+            q0 = self._qpos0 if qpos is None else np.asarray(qpos, np.float32)
+            q0 = np.broadcast_to(q0, (self.num_worlds, self.nq))
+            for i, d in enumerate(self._datas):
+                mujoco.mj_resetData(self.mjm, d)
+                d.qpos[:] = q0[i]
+                d.qvel[:] = 0.0
+                d.ctrl[:] = 0.0
+                mujoco.mj_forward(self.mjm, d)
+            return self.observe()
         with wp.ScopedDevice(self.device):
             q0 = self._qpos0 if qpos is None else np.asarray(qpos, np.float32)
             q0 = np.broadcast_to(q0, (self.num_worlds, self.nq)).copy()
@@ -250,6 +306,16 @@ class G1Env:
 
     def step(self, action) -> dict:
         """Apply ``action`` (nworld, nu) to the actuators and advance physics."""
+        if self.is_cpu:
+            a = action.numpy() if isinstance(action, wp.array) else np.asarray(action)
+            a = np.ascontiguousarray(a, np.float32)
+            if a.ndim == 1:
+                a = a[None]
+            for i, d in enumerate(self._datas):
+                d.ctrl[:] = a[i]
+                for _ in range(self.cfg.n_substeps):
+                    mujoco.mj_step(self.mjm, d)
+            return self.observe()
         with wp.ScopedDevice(self.device):
             ctrl_t = wp.to_torch(self.d.ctrl) if self.backend == "torch" else None
             if isinstance(action, np.ndarray):
@@ -267,6 +333,13 @@ class G1Env:
 
     def observe(self) -> dict:
         """Raw proprioceptive observation. Task-specific packing goes on top."""
+        if self.is_cpu:
+            qpos = np.stack([d.qpos for d in self._datas]).astype(np.float32)
+            qvel = np.stack([d.qvel for d in self._datas]).astype(np.float32)
+            sd = np.stack([d.sensordata for d in self._datas]).astype(np.float32)
+            t = np.array([d.time for d in self._datas], np.float32)
+            return {"qpos": self._out(qpos), "qvel": self._out(qvel),
+                    "sensordata": self._out(sd), "time": self._out(t)}
         return {
             "qpos": self._out(self.d.qpos),      # (N, nq)  free base = [pos3, quat4, joints]
             "qvel": self._out(self.d.qvel),      # (N, nv)  free base = [linvel3, angvel3, joints]
@@ -277,8 +350,31 @@ class G1Env:
     def render(self) -> dict:
         """Render all requested cameras for all worlds. Returns
         {cam_name: {"rgb": (N,H,W,3) uint8, "depth": (N,H,W) float32}}."""
-        if self._rc is None:
+        if not self._want_render:
             raise RuntimeError("no cameras configured; pass cameras=[...] to G1Env")
+        if self.is_cpu:
+            out: dict[str, dict] = {}
+            for c in self._cams:
+                cid = self._cam_index[c.name]
+                r = self._renderers[(c.height, c.width)]
+                entry: dict = {}
+                if self.cfg.render_rgb:
+                    rgbs = []
+                    for d in self._datas:
+                        r.disable_depth_rendering()
+                        r.update_scene(d, camera=cid)
+                        rgbs.append(r.render().copy())
+                    entry["rgb"] = self._out(np.stack(rgbs).astype(np.uint8))
+                if self.cfg.render_depth:
+                    depths = []
+                    for d in self._datas:
+                        r.enable_depth_rendering()
+                        r.update_scene(d, camera=cid)
+                        depths.append((r.render() * self.cfg.depth_scale).copy())
+                    r.disable_depth_rendering()
+                    entry["depth"] = self._out(np.stack(depths).astype(np.float32))
+                out[c.name] = entry
+            return out
         out: dict[str, dict] = {}
         with wp.ScopedDevice(self.device):
             mjw.refit_bvh(self.m, self.d, self._rc)

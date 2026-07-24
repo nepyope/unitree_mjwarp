@@ -33,6 +33,31 @@ python smoke_test.py --worlds 2048 --steps 200
 python smoke_test.py --worlds 512 --steps 200 --cameras head track --save-png head0.png
 ```
 
+## CPU vs GPU
+
+The same `G1Env` API runs on either device:
+
+- **GPU (`device="cuda:0"`, default)** — mjwarp: thousands of vectorized worlds +
+  batched RGB/depth cameras on the GPU. For training.
+- **CPU (`device="cpu"`)** — native MuJoCo (`mj_step`) over a list of `MjData`,
+  ideal for 1 (or a few) envs, no CUDA needed. Cameras render offscreen via
+  `mujoco.Renderer` (set `MUJOCO_GL=egl` on a headless box).
+
+```bash
+python smoke_test.py --device cpu --worlds 1 --steps 100                 # native MuJoCo
+MUJOCO_GL=egl python smoke_test.py --device cpu --worlds 1 --cameras head
+```
+
+```python
+env = G1Env(num_worlds=1, device="cpu")            # native MuJoCo, obs as numpy
+env = G1Env(num_worlds=4096, device="cuda:0")      # mjwarp, obs as warp arrays
+```
+
+On CPU the `warp` backend transparently falls back to `numpy` (there are no warp
+arrays); pass `backend="torch"` for tensors on either device. This makes the repo
+container-ready: base a CUDA image with `mujoco`+`warp-lang`, run with `--gpus all`
+for the GPU path or without it (CPU path) on hosts with no GPU.
+
 ## Head mode (interactive viewer)
 
 `render()` is headless (GPU image tensors, no window). To *watch* the sim live,

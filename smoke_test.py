@@ -22,13 +22,16 @@ def main():
     p.add_argument("--worlds", type=int, default=2048)
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--substeps", type=int, default=1)
+    p.add_argument("--device", type=str, default="cuda:0",
+                   help='"cuda:0" (mjwarp, vectorized) or "cpu" (native MuJoCo)')
     p.add_argument("--cameras", nargs="*", default=[])
     p.add_argument("--save-png", type=str, default=None,
                    help="save world-0 RGB of the first listed camera here")
     args = p.parse_args()
 
+    backend = "numpy" if args.device.startswith("cpu") else "warp"
     env = G1Env(num_worlds=args.worlds, cameras=args.cameras,
-                n_substeps=args.substeps, backend="warp")
+                n_substeps=args.substeps, backend=backend, device=args.device)
     print(env)
     print("actuators:", env.actuator_names())
 
@@ -37,8 +40,9 @@ def main():
     for k, v in obs.items():
         print(f"  {k:12s} {tuple(v.shape)} {v.dtype}")
 
-    # zero-torque action of the right shape.
-    act = wp.zeros((env.num_worlds, env.nu), dtype=wp.float32)
+    # zero action of the right shape.
+    act = (np.zeros((env.num_worlds, env.nu), np.float32) if env.is_cpu
+           else wp.zeros((env.num_worlds, env.nu), dtype=wp.float32))
 
     # warmup (JIT kernels compile on first call)
     env.step(act)
