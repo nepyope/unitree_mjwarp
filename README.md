@@ -33,6 +33,19 @@ python smoke_test.py --worlds 2048 --steps 200
 python smoke_test.py --worlds 512 --steps 200 --cameras head track --save-png head0.png
 ```
 
+## Head mode (interactive viewer)
+
+`render()` is headless (GPU image tensors, no window). To *watch* the sim live,
+run `view.py`: physics still runs batched on the GPU, and one world is mirrored
+into a real `mujoco.viewer` window each frame (via `mjw.get_data_into`). Needs a
+local display, so run it on your workstation.
+
+```bash
+python view.py --worlds 64 --world 0 --realtime
+```
+
+Mouse-orbit with the standard viewer controls; Ctrl-C or close the window to quit.
+
 ## Use it as a library
 
 ```python

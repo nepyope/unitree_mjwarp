@@ -113,7 +113,7 @@ def _add_scene_extras(spec: mujoco.MjSpec, cfg: G1EnvConfig,
         light = spec.worldbody.add_light()
         light.pos = [0.0, 0.0, 3.0]
         light.dir = [0.0, 0.0, -1.0]
-        light.directional = True
+        light.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
 
     bodies = {b.name for b in spec.bodies}
     existing = {c.name for c in spec.cameras}
