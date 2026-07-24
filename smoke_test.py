@@ -71,7 +71,7 @@ def main():
                 print(f"  {name}/{kind:5s} {tuple(arr.shape)} {arr.dtype}")
 
         if args.save_png:
-            name = args.cameras[0]
+            name = env.camera_names[0]  # resolved model camera name
             rgb = env.render()[name]["rgb"].numpy()[0]  # (H,W,3) vec3f -> float
             img = np.clip(rgb, 0, 1) if rgb.max() <= 1.0 else np.clip(rgb / 255.0, 0, 1)
             try:

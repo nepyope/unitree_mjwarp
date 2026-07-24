@@ -35,7 +35,7 @@ import warp as wp
 import mujoco_warp as mjw
 
 _BUNDLED_G1_XML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "assets", "g1", "g1.xml")
+                               "assets", "g1", "scene_29dof.xml")
 DEFAULT_G1_XML = os.environ.get("G1_XML", _BUNDLED_G1_XML)
 
 
@@ -55,19 +55,13 @@ class CameraSpec:
     fovy: float = 58.0
 
 
-# A couple of sensible defaults so `cameras=["head","track"]` just works.
+# Convenience aliases. "head"/"track" map to the cameras the lerobot G1 sim
+# scene already ships (head_camera, global_view); if a requested camera name is
+# already defined in the loaded MJCF we reuse it in place (no re-add), otherwise
+# a matching CameraSpec here is added to the scene.
 _PRESET_CAMERAS: dict[str, CameraSpec] = {
-    # First-person head camera looking forward (+x), mounted on the head link.
-    "head": CameraSpec(
-        name="head", mount="head_link", target=None,
-        pos=(0.08, 0.0, 0.0), quat=(0.5, 0.5, -0.5, -0.5), fovy=70.0,
-        width=224, height=224,
-    ),
-    # Third-person chase camera tracking the pelvis.
-    "track": CameraSpec(
-        name="track", mount=None, target="pelvis",
-        pos=(2.5, -2.0, 1.5), width=256, height=256, fovy=45.0,
-    ),
+    "head": CameraSpec(name="head_camera", width=224, height=224),
+    "track": CameraSpec(name="global_view", width=256, height=256),
 }
 
 
@@ -83,36 +77,49 @@ class G1EnvConfig:
     render_rgb: bool = True
     render_depth: bool = True
     depth_scale: float = 1.0
+    njmax: int | None = 256     # per-world constraint cap (avoids nefc overflow)
+    nconmax: int | None = None
 
 
 def _add_scene_extras(spec: mujoco.MjSpec, cfg: G1EnvConfig,
                       cams: list[CameraSpec]) -> None:
-    """Add a floor, a light, and the requested cameras onto the loaded G1 spec."""
-    if cfg.add_floor:
-        # checker ground so the batch renderer's textures/depth have structure.
-        spec.add_texture(
-            name="groundtex", type=mujoco.mjtTexture.mjTEXTURE_2D,
-            builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
-            rgb1=[0.2, 0.3, 0.4], rgb2=[0.1, 0.15, 0.2],
-            width=300, height=300,
-        )
-        spec.add_material(
-            name="groundplane", textures=["", "groundtex"],
-            texrepeat=[5, 5], texuniform=True, reflectance=0.0,
-        )
+    """Add the requested cameras (and a floor/light only if the model lacks
+    them) onto the loaded G1 spec. Many G1 MJCFs already ship a ground plane,
+    skybox and light, so we add those idempotently."""
+    geom_names = {g.name for g in spec.geoms}
+    tex_names = {t.name for t in spec.textures}
+    mat_names = {m.name for m in spec.materials}
+
+    if cfg.add_floor and "floor" not in geom_names:
+        if "groundtex" not in tex_names:
+            spec.add_texture(
+                name="groundtex", type=mujoco.mjtTexture.mjTEXTURE_2D,
+                builtin=mujoco.mjtBuiltin.mjBUILTIN_CHECKER,
+                rgb1=[0.2, 0.3, 0.4], rgb2=[0.1, 0.15, 0.2],
+                width=300, height=300,
+            )
+        if "groundplane" not in mat_names:
+            spec.add_material(
+                name="groundplane", textures=["", "groundtex"],
+                texrepeat=[5, 5], texuniform=True, reflectance=0.0,
+            )
         floor = spec.worldbody.add_geom()
         floor.name = "floor"
         floor.type = mujoco.mjtGeom.mjGEOM_PLANE
         floor.size = [0.0, 0.0, 0.05]
         floor.material = "groundplane"
 
-    light = spec.worldbody.add_light()
-    light.pos = [0.0, 0.0, 3.0]
-    light.dir = [0.0, 0.0, -1.0]
-    light.directional = True
+    if not spec.lights:
+        light = spec.worldbody.add_light()
+        light.pos = [0.0, 0.0, 3.0]
+        light.dir = [0.0, 0.0, -1.0]
+        light.directional = True
 
     bodies = {b.name for b in spec.bodies}
+    existing = {c.name for c in spec.cameras}
     for c in cams:
+        if c.name in existing:  # reuse a camera already defined in the MJCF
+            continue
         if c.mount is not None and c.mount in bodies:
             body = next(b for b in spec.bodies if b.name == c.mount)
             cam = body.add_camera()
@@ -164,7 +171,8 @@ class G1Env:
 
         with wp.ScopedDevice(self.device):
             self.m = mjw.put_model(self.mjm)
-            self.d = mjw.put_data(self.mjm, self.mjd, nworld=cfg.num_worlds)
+            self.d = mjw.put_data(self.mjm, self.mjd, nworld=cfg.num_worlds,
+                                  njmax=cfg.njmax, nconmax=cfg.nconmax)
 
         self._rc = None
         self._rgb_out: dict[str, wp.array] = {}
@@ -182,25 +190,41 @@ class G1Env:
                 raise RuntimeError(f"camera {c.name!r} not found after compile")
             self._cam_index[c.name] = cid
 
-        cam_res = [(c.width, c.height) for c in self._cams]
-        active = [False] * self.mjm.ncam
+        # The batch renderer indexes every buffer by *model camera id*, so all
+        # per-camera config lists must be full length (ncam), not just the
+        # cameras we asked for. Inactive cameras get a tiny res and no output.
+        ncam = self.mjm.ncam
+        res_by_id = [(c.width, c.height) for c in self._cams]  # placeholder default
+        cam_res = [(8, 8)] * ncam
+        render_rgb = [False] * ncam
+        render_depth = [False] * ncam
+        active = [False] * ncam
+        # resolution requested per camera (default 128 if a camera was requested
+        # by name only, i.e. a preset/spec without explicit size still carries one)
+        self._cam_res = {}
         for c in self._cams:
-            active[self._cam_index[c.name]] = True
+            cid = self._cam_index[c.name]
+            cam_res[cid] = (c.width, c.height)
+            render_rgb[cid] = cfg.render_rgb
+            render_depth[cid] = cfg.render_depth
+            active[cid] = True
+            self._cam_res[c.name] = (c.width, c.height)
 
         with wp.ScopedDevice(self.device):
             self._rc = mjw.create_render_context(
                 self.mjm, nworld=cfg.num_worlds,
-                cam_res=cam_res if len(set(cam_res)) > 1 else cam_res[0],
-                render_rgb=cfg.render_rgb, render_depth=cfg.render_depth,
-                cam_active=active if self.mjm.ncam > len(self._cams) else None,
+                cam_res=cam_res,
+                render_rgb=render_rgb, render_depth=render_depth,
+                cam_active=active,
             )
             for c in self._cams:
+                w, h = self._cam_res[c.name]
                 if cfg.render_rgb:
                     self._rgb_out[c.name] = wp.zeros(
-                        (cfg.num_worlds, c.height, c.width), dtype=wp.vec3f)
+                        (cfg.num_worlds, h, w), dtype=wp.vec3f)
                 if cfg.render_depth:
                     self._depth_out[c.name] = wp.zeros(
-                        (cfg.num_worlds, c.height, c.width), dtype=wp.float32)
+                        (cfg.num_worlds, h, w), dtype=wp.float32)
 
     # -- conversion helper -------------------------------------------------
     def _out(self, arr: wp.array):
@@ -276,6 +300,10 @@ class G1Env:
     @property
     def dt(self) -> float:
         return float(self.mjm.opt.timestep) * self.cfg.n_substeps
+
+    @property
+    def camera_names(self) -> list[str]:
+        return [c.name for c in self._cams]
 
     def actuator_names(self) -> list[str]:
         return [mujoco.mj_id2name(self.mjm, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
