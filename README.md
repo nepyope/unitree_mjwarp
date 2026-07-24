@@ -58,18 +58,30 @@ arrays); pass `backend="torch"` for tensors on either device. This makes the rep
 container-ready: base a CUDA image with `mujoco`+`warp-lang`, run with `--gpus all`
 for the GPU path or without it (CPU path) on hosts with no GPU.
 
-## Head mode (interactive viewer)
+## Watching the sim
 
-`render()` is headless (GPU image tensors, no window). To *watch* the sim live,
-run `view.py`: physics still runs batched on the GPU, and one world is mirrored
-into a real `mujoco.viewer` window each frame (via `mjw.get_data_into`). Needs a
-local display, so run it on your workstation.
+`render()` is headless (GPU image tensors, no window). For live viewing there are
+two options:
+
+**Browser / headless / Docker — `view_meshcat.py` (recommended for containers).**
+Renders in a web browser over a websocket, so it works on a headless node or in a
+container — just forward the printed port. Works on CPU or GPU, tiled across worlds.
 
 ```bash
-python view.py --worlds 64 --world 0 --realtime
+python view_meshcat.py --device cpu   --worlds 1
+python view_meshcat.py --device cuda:0 --worlds 16 --spacing 1.0
+# then open the printed URL, e.g. http://127.0.0.1:7000/static/
 ```
 
-Mouse-orbit with the standard viewer controls; Ctrl-C or close the window to quit.
+It builds geometry directly from the compiled model (mesh verts/faces + primitives,
+no STL lookups) and pushes each geom's world transform per frame.
+
+**Local desktop — `mujoco.viewer` windows** (need a local display):
+
+```bash
+python view.py --worlds 64 --world 0 --realtime   # mirror one world
+python view_all.py --worlds 36 --spacing 1.0      # tiled grid of all worlds
+```
 
 ## Use it as a library
 

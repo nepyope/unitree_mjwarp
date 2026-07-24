@@ -3,3 +3,4 @@ mujoco>=3.10.0
 mujoco-warp @ git+https://github.com/google-deepmind/mujoco_warp.git
 numpy>=2.0
 pillow
+meshcat        # headless browser-based viewer (view_meshcat.py)
